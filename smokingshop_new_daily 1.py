@@ -619,7 +619,7 @@ def find_changed_cost_records(**kwargs):
                 if not isinstance(first_item, (tuple, list)) or len(first_item) != 5:
                     logger.warning("Data format issue detected, attempting to fix...")
                     # Предполагаем, что данные приходят как плоский список и группируем по 5 элементов
-                    if len(ch_data) % 5 == 0:
+                    if len(ch_data) % 10 == 0:
                         ch_data = [tuple(ch_data[i:i+5]) for i in range(0, len(ch_data), 5)]
                         logger.info(f"Data reformatted, new length: {len(ch_data)}")
                     else:
@@ -647,13 +647,14 @@ def find_changed_cost_records(**kwargs):
             comparison_df['cost_sum_mariadb'] = pd.to_numeric(comparison_df['cost_sum_mariadb'], errors='coerce').fillna(0)
             comparison_df['cost_sum_clickhouse'] = pd.to_numeric(comparison_df['cost_sum_clickhouse'], errors='coerce').fillna(0)
             
-            # Находим записи с измененной суммой(с допуском для float)
+            # Находим записи с измененной суммой(с допуском для float и с округлением для исключения незначительных изменений)
+            tolerance=0.01
             changed_records = comparison_df[
                 ~np.isclose(
                     comparison_df['cost_sum_mariadb'], 
                     comparison_df['cost_sum_clickhouse'],
                     rtol=1e-9,
-                    atol=1e-9
+                    atol=tolerance
                 )
             ]
             

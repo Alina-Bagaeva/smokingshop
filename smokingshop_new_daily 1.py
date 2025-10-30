@@ -25,6 +25,7 @@ import os
 import gc
 import logging
 import json
+import numpy as np
 
 # Импорты для типизации
 from typing import Set, List, Tuple, Optional, Any
@@ -537,6 +538,7 @@ def find_changed_cost_records(**kwargs):
             logger.info("No MariaDB data file found for cost comparison")
             ti.xcom_push(key='changed_cost_records_path', value=None)
             ti.xcom_push(key='has_changed_cost_records', value=False)
+            ti.xcom_push(key='changed_cost_records_count', value=0)
             return
         
         logger.info("Starting cost price change detection using sum comparison")
@@ -550,10 +552,10 @@ def find_changed_cost_records(**kwargs):
         logger.info(f"The data from the MariaDB source for comparison is downloaded from file {mariadb_data_path}")
         
         # Создаем ключ и вычисляем сумму полей себестоимости
-        df_mariadb['key'] = df_mariadb['sbis_account_id'].astype(str) + '_' + \
-                           df_mariadb['document_id'].astype(str) + '_' + \
-                           df_mariadb['tabular_row_id'].astype(str)
-        df_mariadb['cost_sum_mariadb'] = df_mariadb['nomenclature_cost_price'] + df_mariadb['nomenclature_cost_price_total']
+        df_mariadb['key'] = df_mariadb['sbis_account_id'].fillna('').astype(str) + '_' + \
+                           df_mariadb['document_id'].fillna('').astype(str) + '_' + \
+                           df_mariadb['tabular_row_id'].fillna('').astype(str)
+        df_mariadb['cost_sum_mariadb'] = df_mariadb['nomenclature_cost_price'].fillna(0) + df_mariadb['nomenclature_cost_price_total'].fillna(0)
         
         with DatabaseConnectionContext() as db:
             ch_hook = db.get_clickhouse_hook()
@@ -580,34 +582,59 @@ def find_changed_cost_records(**kwargs):
                     
                     # Логируем каждые 100к строк
                     if total_rows % 100000 == 0:
-                        print(f"Progress: loaded {total_rows} rows...")
+                        logger.info(f"Progress: loaded {total_rows} rows...")
                         
             except Exception as e:
-                print(f"Error during iterative reading: {e}")
+                logger.error(f"Error during iterative reading: {e}")
                 # Fallback: попробуем с меньшим размером блока
                 ch_data = []
-                for rows in client.execute_iter(existing_data_sql, settings={'max_block_size': 10000}):
-                    ch_data.extend(rows)
+                try:
+                    for rows in client.execute_iter(existing_data_sql, settings={'max_block_size': 10000}):
+                        ch_data.extend(rows)
+                        total_rows += len(rows)
+                        if total_rows % 50000 == 0:
+                            logger.info(f"Fallback progress: loaded {total_rows} rows...")
+                except Exception as fallback_error:
+                    logger.error(f"Fallback reading also failed: {fallback_error}")
+                    raise
             
-            print(f"Successfully loaded {len(ch_data)} total rows from Clickhouse table {TABLE_NAME}")
+            logger.info(f"Successfully loaded {len(ch_data)} total rows from Clickhouse table {TABLE_NAME}")
 
             if not ch_data:
                 logger.info("No existing data in ClickHouse for cost comparison")
                 ti.xcom_push(key='changed_cost_records_path', value=None)
                 ti.xcom_push(key='has_changed_cost_records', value=False)
+                ti.xcom_push(key='changed_cost_records_count', value=0)
                 return
             
             # Создаем DataFrame из данных ClickHouse
+            # Проверяем структуру данных для отладки
+            if ch_data:
+                # Проверяем первый элемент
+                first_item = ch_data[0]
+                logger.info(f"Type of first item: {type(first_item)}")
+                logger.info(f"Length of first item: {len(first_item) if hasattr(first_item, '__len__') else 'No length'}")
+                
+                # Если данные в неправильном формате, преобразуем их
+                if not isinstance(first_item, (tuple, list)) or len(first_item) != 5:
+                    logger.warning("Data format issue detected, attempting to fix...")
+                    # Предполагаем, что данные приходят как плоский список и группируем по 5 элементов
+                    if len(ch_data) % 5 == 0:
+                        ch_data = [tuple(ch_data[i:i+5]) for i in range(0, len(ch_data), 5)]
+                        logger.info(f"Data reformatted, new length: {len(ch_data)}")
+                    else:
+                        raise ValueError(f"Unexpected data format: cannot group into 5-column rows from {len(ch_data)} elements")
+                    
             ch_df = pd.DataFrame(ch_data, columns=[
                 'sbis_account_id', 'document_id', 'tabular_row_id',
                 'nomenclature_cost_price', 'nomenclature_cost_price_total'
             ])
             
             # Создаем ключ и вычисляем сумму полей себестоимости
-            ch_df['key'] = ch_df['sbis_account_id'].astype(str) + '_' + \
-                          ch_df['document_id'].astype(str) + '_' + \
-                          ch_df['tabular_row_id'].astype(str)
-            ch_df['cost_sum_clickhouse'] = ch_df['nomenclature_cost_price'] + ch_df['nomenclature_cost_price_total']
+            ch_df['key'] = ch_df['sbis_account_id'].fillna('').astype(str) + '_' + \
+                          ch_df['document_id'].fillna('').astype(str) + '_' + \
+                          ch_df['tabular_row_id'].fillna('').astype(str)
+            ch_df['cost_sum_clickhouse'] = ch_df['nomenclature_cost_price'].fillna(0) + ch_df['nomenclature_cost_price_total'].fillna(0)
             
             # Объединяем данные для сравнения
             comparison_df = df_mariadb.merge(
@@ -616,9 +643,18 @@ def find_changed_cost_records(**kwargs):
                 how='inner'  # Только существующие записи в обеих системах
             )
             
-            # Находим записи с измененной суммой
+            # Приводим к числовым типам и заполняем NaN
+            comparison_df['cost_sum_mariadb'] = pd.to_numeric(comparison_df['cost_sum_mariadb'], errors='coerce').fillna(0)
+            comparison_df['cost_sum_clickhouse'] = pd.to_numeric(comparison_df['cost_sum_clickhouse'], errors='coerce').fillna(0)
+            
+            # Находим записи с измененной суммой(с допуском для float)
             changed_records = comparison_df[
-                comparison_df['cost_sum_mariadb'] != comparison_df['cost_sum_clickhouse']
+                ~np.isclose(
+                    comparison_df['cost_sum_mariadb'], 
+                    comparison_df['cost_sum_clickhouse'],
+                    rtol=1e-9,
+                    atol=1e-9
+                )
             ]
             
             if changed_records.empty:

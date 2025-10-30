@@ -569,9 +569,28 @@ def find_changed_cost_records(**kwargs):
                     nomenclature_cost_price_total
                 FROM {TABLE_NAME}
             """
+            # Читаем данные из clickhouse по частям            
+            ch_data =  []
+            total_rows = 0
             
-            ch_data = client.execute(existing_data_sql)
+            try:
+                for rows in client.execute_iter(existing_data_sql, settings={'max_block_size': 50000}):
+                    ch_data.extend(rows)
+                    total_rows += len(rows)
+                    
+                    # Логируем каждые 100к строк
+                    if total_rows % 100000 == 0:
+                        print(f"Progress: loaded {total_rows} rows...")
+                        
+            except Exception as e:
+                print(f"Error during iterative reading: {e}")
+                # Fallback: попробуем с меньшим размером блока
+                ch_data = []
+                for rows in client.execute_iter(existing_data_sql, settings={'max_block_size': 10000}):
+                    ch_data.extend(rows)
             
+            print(f"Successfully loaded {len(ch_data)} total rows from Clickhouse table {TABLE_NAME}")
+
             if not ch_data:
                 logger.info("No existing data in ClickHouse for cost comparison")
                 ti.xcom_push(key='changed_cost_records_path', value=None)

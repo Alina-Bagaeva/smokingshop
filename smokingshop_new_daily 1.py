@@ -619,7 +619,7 @@ def find_changed_cost_records(**kwargs):
                 if not isinstance(first_item, (tuple, list)) or len(first_item) != 5:
                     logger.warning("Data format issue detected, attempting to fix...")
                     # Предполагаем, что данные приходят как плоский список и группируем по 5 элементов
-                    if len(ch_data) % 10 == 0:
+                    if len(ch_data) % 5 == 0:
                         ch_data = [tuple(ch_data[i:i+5]) for i in range(0, len(ch_data), 5)]
                         logger.info(f"Data reformatted, new length: {len(ch_data)}")
                     else:
@@ -647,7 +647,7 @@ def find_changed_cost_records(**kwargs):
             comparison_df['cost_sum_mariadb'] = pd.to_numeric(comparison_df['cost_sum_mariadb'], errors='coerce').fillna(0)
             comparison_df['cost_sum_clickhouse'] = pd.to_numeric(comparison_df['cost_sum_clickhouse'], errors='coerce').fillna(0)
             
-            # Находим записи с измененной суммой(с допуском для float и с округлением для исключения незначительных изменений)
+            # Находим записи с измененной суммой(с допуском для float)
             tolerance=0.01
             changed_records = comparison_df[
                 ~np.isclose(
@@ -796,11 +796,23 @@ def compare_data(**kwargs):
                 concat(toString(sbis_account_id), '_', toString(document_id), '_', toString(tabular_row_id)) as key
             FROM {TABLE_NAME}
             """
-            
-            existing_data = client.execute(existing_keys_sql)
-            existing_keys_set = {row[0] for row in existing_data}
-            
-            logger.info(f"Found {len(existing_keys_set)} existing keys in ClickHouse")
+            existing_keys_set = set()
+            batch_size = 50000
+            current_batch = set()
+
+            for row in client.execute_iter(existing_keys_sql, settings={'max_block_size': 10000}):
+                current_batch.add(row[0])
+                
+                if len(current_batch) >= batch_size:
+                    existing_keys_set.update(current_batch)
+                    current_batch.clear()
+                    logger.info(f"Progress: {len(existing_keys_set)} keys loaded...")
+
+            # Добавляем последний неполный батч
+            if current_batch:
+                existing_keys_set.update(current_batch)
+
+            logger.info(f"Total unique keys loaded: {len(existing_keys_set)}")
             
             # Создаем множество ключей из MariaDB
             mariadb_keys_set = set(df_keys['key'].tolist())

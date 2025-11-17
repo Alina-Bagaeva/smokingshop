@@ -26,6 +26,7 @@ import gc
 import logging
 import json
 import numpy as np
+import shutil
 
 # Импорты для типизации
 from typing import Set, List, Tuple, Optional, Any
@@ -691,6 +692,97 @@ def find_changed_cost_records(**kwargs):
         logger.error(f"Error in find_changed_cost_records: {str(e)}", exc_info=True)
         raise AirflowException(f"Cost records change detection failed: {str(e)}")
 
+# Функция для очистки логов и временных файлов ClickHouse
+def cleanup_clickhouse_temp_files(**kwargs):
+    try:
+        logger.info("Starting ClickHouse temporary files cleanup")
+        
+        # Пути к временным файлам ClickHouse (могут отличаться в зависимости от установки)
+        clickhouse_temp_paths = [
+            '/var/lib/clickhouse/tmp/',
+            '/var/lib/clickhouse/store/*/tmp_*',
+            '/var/lib/clickhouse/data/*/tmp_*',
+        ]
+        
+        # Пути к логам ClickHouse (можно очистить старые логи)
+        clickhouse_log_paths = [
+            '/var/log/clickhouse/clickhouse-server.log.*',
+            '/var/log/clickhouse/clickhouse-server.err.log.*',
+        ]
+        
+        cleaned_size = 0
+        cleaned_files = 0
+        
+        # Очищаем временные файлы
+        for temp_path in clickhouse_temp_paths:
+            try:
+                # Используем glob для поиска файлов по шаблону
+                import glob
+                for file_path in glob.glob(temp_path):
+                    try:
+                        if os.path.isfile(file_path):
+                            file_size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            cleaned_size += file_size
+                            cleaned_files += 1
+                            logger.info(f"Removed temporary file: {file_path} ({file_size} bytes)")
+                        elif os.path.isdir(file_path):
+                            # Для директорий используем shutil
+                            dir_size = sum(f.stat().st_size for f in os.scandir(file_path) if f.is_file())
+                            shutil.rmtree(file_path)
+                            cleaned_size += dir_size
+                            cleaned_files += 1
+                            logger.info(f"Removed temporary directory: {file_path} ({dir_size} bytes)")
+                    except Exception as e:
+                        logger.warning(f"Could not remove {file_path}: {str(e)}")
+            except Exception as e:
+                logger.warning(f"Error processing path {temp_path}: {str(e)}")
+        
+        # Очищаем старые логи (оставляем только текущие)
+        for log_path in clickhouse_log_paths:
+            try:
+                import glob
+                for file_path in glob.glob(log_path):
+                    try:
+                        if os.path.isfile(file_path):
+                            file_size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            cleaned_size += file_size
+                            cleaned_files += 1
+                            logger.info(f"Removed log file: {file_path} ({file_size} bytes)")
+                    except Exception as e:
+                        logger.warning(f"Could not remove log file {file_path}: {str(e)}")
+            except Exception as e:
+                logger.warning(f"Error processing log path {log_path}: {str(e)}")
+        
+        # Проверяем свободное место после очистки
+        try:
+            statvfs = os.statvfs('/var/lib/clickhouse')
+            free_space_gb = (statvfs.f_frsize * statvfs.f_bavail) / (1024 ** 3)
+            total_space_gb = (statvfs.f_frsize * statvfs.f_blocks) / (1024 ** 3)
+            logger.info(f"Disk space after cleanup: {free_space_gb:.2f} GB free of {total_space_gb:.2f} GB total")
+            
+            if free_space_gb < 1.0:  # Меньше 1 GB свободного места
+                logger.error(f"CRITICAL: Very low disk space after cleanup: {free_space_gb:.2f} GB")
+                raise AirflowException(f"Insufficient disk space after cleanup: {free_space_gb:.2f} GB")
+                
+        except Exception as e:
+            logger.warning(f"Could not check disk space: {str(e)}")
+        
+        logger.info(f"ClickHouse cleanup completed: {cleaned_files} files removed, {cleaned_size} bytes freed")
+        
+        # Сохраняем информацию об очистке в XCom
+        ti = kwargs['ti']
+        ti.xcom_push(key='clickhouse_cleanup_info', value={
+            'cleaned_files': cleaned_files,
+            'cleaned_bytes': cleaned_size,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in cleanup_clickhouse_temp_files: {str(e)}")
+        raise AirflowException(f"ClickHouse temporary files cleanup failed: {str(e)}")
+    
 # Удаляем из ClickHouse записи, у которых изменились цены себестоимости
 @retry_with_backoff()
 def delete_changed_records_from_clickhouse(**kwargs):
@@ -729,14 +821,36 @@ def delete_changed_records_from_clickhouse(**kwargs):
                 delete_sql = f"ALTER TABLE {TABLE_NAME} DELETE WHERE {where_clause}"
                 
                 logger.info(f"Deleting batch {i//batch_size + 1} with {len(batch_conditions)} conditions")
-                client.execute(delete_sql)
-                total_deleted += len(batch_conditions)
+                
+                try:
+                    client.execute(delete_sql)
+                    total_deleted += len(batch_conditions)
+                    
+                except Exception as delete_error:
+                    error_msg = str(delete_error)
+                    if "No space left on device" in error_msg or "errno: 28" in error_msg:
+                        logger.error("Disk space error detected during deletion, triggering cleanup")
+                        
+                        # Сохраняем прогресс удаления
+                        ti.xcom_push(key='delete_progress', value={
+                            'processed_batches': i//batch_size + 1,
+                            'total_conditions': len(delete_conditions),
+                            'successfully_deleted': total_deleted
+                        })
+                        
+                        raise AirflowException("Insufficient disk space during deletion") from delete_error
+                    else:
+                        # Другие ошибки прокидываем как есть
+                        raise
                 
                 # Небольшая пауза между батчами
                 time.sleep(1)
             
             logger.info(f"Successfully deleted {total_deleted} changed records from ClickHouse")
             
+    except AirflowException as e:
+        # Пробрасываем ошибку нехватки места для обработки в DAG
+        raise
     except Exception as e:
         logger.error(f"Error in delete_changed_records_from_clickhouse: {str(e)}", exc_info=True)
         raise AirflowException(f"Deletion of changed records failed: {str(e)}")
@@ -996,6 +1110,36 @@ def cleanup_file(**kwargs):
     except Exception as e:
         logger.error(f"Error in cleanup_file: {str(e)}", exc_info=True)
 
+# Добавим новую функцию для обработки ошибки нехватки места
+def handle_disk_space_error(**kwargs):
+    """
+    Обработчик ошибки нехватки места на диске
+    """
+    try:
+        ti = kwargs['ti']
+        
+        # Получаем контекст выполнения для анализа ошибки
+        context = kwargs.get('context', {})
+        exception = context.get('exception')
+        
+        if exception and ("No space left on device" in str(exception) or "errno: 28" in str(exception)):
+            logger.error("Disk space error detected, performing emergency cleanup and failing DAG")
+            
+            # Выполняем экстренную очистку
+            cleanup_clickhouse_temp_files(**kwargs)
+            
+            # Выполняем очистку временных файлов DAG
+            cleanup_file(**kwargs)
+            
+            # Логируем критическую ошибку
+            logger.critical("CRITICAL: Insufficient disk space. DAG failed after emergency cleanup.")
+            
+        else:
+            logger.info("No disk space error detected in exception")
+            
+    except Exception as e:
+        logger.error(f"Error in handle_disk_space_error: {str(e)}")
+
 # Настройки DAG с улучшенной обработкой ошибок
 default_args = {
     'retries': 3,
@@ -1016,6 +1160,7 @@ with DAG(
     max_active_runs=1,
     concurrency=1,
     default_args=default_args
+    on_failure_callback=handle_disk_space_error
 ) as dag:
     
     check_volume = PythonOperator(
@@ -1032,6 +1177,12 @@ with DAG(
     find_changed_cost_records_task = PythonOperator(
     task_id='find_changed_cost_records',
     python_callable=find_changed_cost_records
+    )
+
+    cleanup_before_deletion = PythonOperator(
+        task_id='cleanup_before_deletion',
+        python_callable=cleanup_clickhouse_temp_files,
+        provide_context=True
     )
 
     delete_changed_records_task = PythonOperator(
@@ -1056,4 +1207,4 @@ with DAG(
     )
     
     # Логика выполнения
-    check_volume >> extract >> find_changed_cost_records_task >> delete_changed_records_task >> compare >> load >> cleanup
+    check_volume >> extract >> find_changed_cost_records_task >> cleanup_before_deletion >> delete_changed_records_task >> compare >> load >> cleanup

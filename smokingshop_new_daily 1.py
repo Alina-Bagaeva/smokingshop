@@ -1159,8 +1159,8 @@ with DAG(
     tags=['smokingshop','mariadb', 'clickhouse', 'etl', 'incremental', 'improved'],
     max_active_runs=1,
     concurrency=1,
-    default_args=default_args
-    on_failure_callback=handle_disk_space_error
+    default_args=default_args,
+    on_failure_callback=handle_disk_space_error,
 ) as dag:
     
     check_volume = PythonOperator(

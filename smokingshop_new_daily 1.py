@@ -386,34 +386,35 @@ def extract_from_mariadb(**kwargs):
             engine = db.get_mysql_engine()
 
             volume_info = ti.xcom_pull(task_ids='check_data_volume', key='data_volume_info')
-        
+
+            # Адаптивные настройки chunk size
             if volume_info:
                 warning_level = volume_info.get('warning_level', 'NORMAL')
                 
                 # Адаптивные настройки
                 if warning_level in ["CRITICAL", "WARNING"]:
-                    chunk_size = 50000
+                    chunk_size = 10000
                     logger.info(f"Using reduced chunk size {chunk_size} for large dataset")
                 else:
-                    chunk_size = 100000
+                    chunk_size = 20000
             else:
-                chunk_size = 100000
+                chunk_size = 20000
             
             logger.info(f"Using chunk size {chunk_size}") 
-            all_chunks = []
+            first_chunk = True
             all_keys = []
-            
             chunk_number = 0
             total_rows = 0
             
-            # Улучшенная обработка чанков с проверкой соединения
+            # Оптимизированная обработка чанков с записью на диск
             for chunk_df in pd.read_sql(SQL_QUERY_ALL, con=engine, chunksize=chunk_size):
                 chunk_number += 1
                 
                 try:
                     # Проверяем соединение перед обработкой чанка
-                    with engine.connect() as test_conn:
-                        test_conn.execute("SELECT 1")
+                    if chunk_number % 5 == 0:
+                        with engine.connect() as test_conn:
+                            test_conn.execute("SELECT 1")
                     
                     logger.info(f"Processing chunk {chunk_number} with {len(chunk_df)} rows")
                     
@@ -421,6 +422,8 @@ def extract_from_mariadb(**kwargs):
                         logger.info(f"Chunk {chunk_number} is empty, skipping")
                         continue
                         
+                    total_rows += len(chunk_df)
+
                     # Создаем ключи для дедупликации
                     chunk_keys = chunk_df[['sbis_account_id', 'document_id', 'tabular_row_id']].copy()
                     chunk_keys['key'] = chunk_keys['sbis_account_id'].astype(str) + '_' + \
@@ -428,14 +431,40 @@ def extract_from_mariadb(**kwargs):
                                       chunk_keys['tabular_row_id'].astype(str)
                     
                     all_keys.extend(chunk_keys['key'].tolist())
-                    all_chunks.append(chunk_df)
-                    total_rows += len(chunk_df)
                     
-                    # Периодически сохраняем прогресс для больших датасетов
-                    if chunk_number % 10 == 0:
+                    # Записываем чанк на диск (не накапливаем в памяти)
+                    if first_chunk:
+                        # Создаем файл с первым чанком
+                        chunk_df.to_parquet(export_path, index=False, compression='snappy')
+                        first_chunk = False
+                        logger.info(f"Created parquet file with first chunk: {export_path}")
+                    else:
+                        # Дописываем последующие чанки
+                        try:
+                            existing_data = pd.read_parquet(export_path)
+                            combined = pd.concat([existing_data, chunk_df], ignore_index=True)
+                            combined.to_parquet(export_path, index=False, compression='snappy')
+                            
+                            # Освобождаем память
+                            del existing_data, combined
+                            logger.info(f"Appended chunk {chunk_number} to parquet file")
+                            
+                        except MemoryError:
+                            # Альтернативный подход при нехватке памяти
+                            logger.warning("Memory error during append, using fallback method")
+                            csv_path = export_path.replace('.parquet', '.csv')
+                            if first_chunk:
+                                chunk_df.to_csv(csv_path, index=False)
+                                first_chunk = False
+                            else:
+                                chunk_df.to_csv(csv_path, mode='a', header=False, index=False)
+                            export_path = csv_path
+                    
+                    # Периодически логируем прогресс
+                    if chunk_number % 5 == 0:
                         logger.info(f"Progress: processed {chunk_number} chunks, {total_rows} total rows")
                     
-                    # Освобождаем память
+                    # Освобождаем память сразу после обработки чанка
                     del chunk_keys
                     del chunk_df
                     gc.collect()
@@ -457,38 +486,15 @@ def extract_from_mariadb(**kwargs):
                     logger.error(f"Unexpected error in chunk {chunk_number}: {str(e)}")
                     raise
             
-            if not all_chunks:
+            if total_rows == 0:
                 logger.warning("No data found in MariaDB table")
                 ti.xcom_push(key='mariadb_data', value=None)
                 ti.xcom_push(key='mariadb_keys_path', value=None)
                 ti.xcom_push(key='has_new_data', value=False)
+                ti.xcom_push(key='total_rows_extracted', value=0)
                 return
             
-            logger.info(f"Combining {len(all_chunks)} chunks")
-            
-            # Улучшенное объединение чанков с обработкой памяти
-            try:
-                df_mariadb = pd.concat(all_chunks, ignore_index=True)
-                logger.info(f"Successfully combined chunks. Total rows: {len(df_mariadb)}")
-            except MemoryError:
-                logger.warning("Memory error during concat, using iterative processing")
-                # Альтернативный подход для больших датасетов
-                df_mariadb = process_chunks_iteratively(all_chunks, export_path)
-                all_chunks.clear()  # Освобождаем память
-            
-            logger.info(f"Extracted {len(df_mariadb)} rows from MariaDB in {chunk_number} chunks")
-            
-            # Сохраняем в файл с обработкой ошибок
-            try:
-                df_mariadb.to_parquet(export_path, index=False, compression='snappy')
-                logger.info(f"Data saved to {export_path}")
-            except Exception as e:
-                logger.error(f"Error saving to parquet: {str(e)}")
-                # Пробуем альтернативный формат
-                csv_path = export_path.replace('.parquet', '.csv')
-                df_mariadb.to_csv(csv_path, index=False)
-                export_path = csv_path 
-                logger.info(f"Data saved to CSV instead: {export_path}")
+            logger.info(f"Extracted {total_rows} rows from MariaDB in {chunk_number} chunks")
             
             # Формируем DataFrame с одним столбцом 'key'
             df_keys = pd.DataFrame({'key': all_keys})
@@ -512,13 +518,13 @@ def extract_from_mariadb(**kwargs):
             ti.xcom_push(key='mariadb_data', value=export_path)
             ti.xcom_push(key='mariadb_keys_path', value=keys_path_to_use)
             ti.xcom_push(key='has_new_data', value=True)
-            ti.xcom_push(key='total_rows_extracted', value=len(df_mariadb))
+            ti.xcom_push(key='total_rows_extracted', value=total_rows)
+            ti.xcom_push(key='chunks_processed', value=chunk_number)
             
             logger.info(f"MariaDB data prepared successfully. Total keys: {len(all_keys)}")
             
             # Освобождаем память
-            del df_mariadb
-            del all_chunks
+            del df_keys
             del all_keys
             gc.collect()
             
@@ -787,10 +793,9 @@ def compare_data(**kwargs):
                 ti.xcom_push(key='new_records_count', value=len(df_keys))
                 return
             
-            # УПРОЩЕННЫЙ ПОДХОД: получаем все ключи из ClickHouse и сравниваем в памяти
             logger.info("Getting existing keys from ClickHouse")
             
-            # Получаем все ключи из ClickHouse в том же формате
+            # Получаем все ключи из ClickHouse в том же формате по частям
             existing_keys_sql = f"""
             SELECT 
                 concat(toString(sbis_account_id), '_', toString(document_id), '_', toString(tabular_row_id)) as key

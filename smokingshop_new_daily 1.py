@@ -387,35 +387,34 @@ def extract_from_mariadb(**kwargs):
             engine = db.get_mysql_engine()
 
             volume_info = ti.xcom_pull(task_ids='check_data_volume', key='data_volume_info')
-
-            # Адаптивные настройки chunk size
+        
             if volume_info:
                 warning_level = volume_info.get('warning_level', 'NORMAL')
                 
                 # Адаптивные настройки
                 if warning_level in ["CRITICAL", "WARNING"]:
-                    chunk_size = 10000
+                    chunk_size = 50000
                     logger.info(f"Using reduced chunk size {chunk_size} for large dataset")
                 else:
-                    chunk_size = 20000
+                    chunk_size = 100000
             else:
-                chunk_size = 20000
+                chunk_size = 100000
             
             logger.info(f"Using chunk size {chunk_size}") 
-            first_chunk = True
+            all_chunks = []
             all_keys = []
+            
             chunk_number = 0
             total_rows = 0
             
-            # Оптимизированная обработка чанков с записью на диск
+            # Улучшенная обработка чанков с проверкой соединения
             for chunk_df in pd.read_sql(SQL_QUERY_ALL, con=engine, chunksize=chunk_size):
                 chunk_number += 1
                 
                 try:
                     # Проверяем соединение перед обработкой чанка
-                    if chunk_number % 5 == 0:
-                        with engine.connect() as test_conn:
-                            test_conn.execute("SELECT 1")
+                    with engine.connect() as test_conn:
+                        test_conn.execute("SELECT 1")
                     
                     logger.info(f"Processing chunk {chunk_number} with {len(chunk_df)} rows")
                     
@@ -423,8 +422,6 @@ def extract_from_mariadb(**kwargs):
                         logger.info(f"Chunk {chunk_number} is empty, skipping")
                         continue
                         
-                    total_rows += len(chunk_df)
-
                     # Создаем ключи для дедупликации
                     chunk_keys = chunk_df[['sbis_account_id', 'document_id', 'tabular_row_id']].copy()
                     chunk_keys['key'] = chunk_keys['sbis_account_id'].astype(str) + '_' + \
@@ -432,40 +429,14 @@ def extract_from_mariadb(**kwargs):
                                       chunk_keys['tabular_row_id'].astype(str)
                     
                     all_keys.extend(chunk_keys['key'].tolist())
+                    all_chunks.append(chunk_df)
+                    total_rows += len(chunk_df)
                     
-                    # Записываем чанк на диск (не накапливаем в памяти)
-                    if first_chunk:
-                        # Создаем файл с первым чанком
-                        chunk_df.to_parquet(export_path, index=False, compression='snappy')
-                        first_chunk = False
-                        logger.info(f"Created parquet file with first chunk: {export_path}")
-                    else:
-                        # Дописываем последующие чанки
-                        try:
-                            existing_data = pd.read_parquet(export_path)
-                            combined = pd.concat([existing_data, chunk_df], ignore_index=True)
-                            combined.to_parquet(export_path, index=False, compression='snappy')
-                            
-                            # Освобождаем память
-                            del existing_data, combined
-                            logger.info(f"Appended chunk {chunk_number} to parquet file")
-                            
-                        except MemoryError:
-                            # Альтернативный подход при нехватке памяти
-                            logger.warning("Memory error during append, using fallback method")
-                            csv_path = export_path.replace('.parquet', '.csv')
-                            if first_chunk:
-                                chunk_df.to_csv(csv_path, index=False)
-                                first_chunk = False
-                            else:
-                                chunk_df.to_csv(csv_path, mode='a', header=False, index=False)
-                            export_path = csv_path
-                    
-                    # Периодически логируем прогресс
-                    if chunk_number % 5 == 0:
+                    # Периодически сохраняем прогресс для больших датасетов
+                    if chunk_number % 10 == 0:
                         logger.info(f"Progress: processed {chunk_number} chunks, {total_rows} total rows")
                     
-                    # Освобождаем память сразу после обработки чанка
+                    # Освобождаем память
                     del chunk_keys
                     del chunk_df
                     gc.collect()
@@ -487,15 +458,38 @@ def extract_from_mariadb(**kwargs):
                     logger.error(f"Unexpected error in chunk {chunk_number}: {str(e)}")
                     raise
             
-            if total_rows == 0:
+            if not all_chunks:
                 logger.warning("No data found in MariaDB table")
                 ti.xcom_push(key='mariadb_data', value=None)
                 ti.xcom_push(key='mariadb_keys_path', value=None)
                 ti.xcom_push(key='has_new_data', value=False)
-                ti.xcom_push(key='total_rows_extracted', value=0)
                 return
             
-            logger.info(f"Extracted {total_rows} rows from MariaDB in {chunk_number} chunks")
+            logger.info(f"Combining {len(all_chunks)} chunks")
+            
+            # Улучшенное объединение чанков с обработкой памяти
+            try:
+                df_mariadb = pd.concat(all_chunks, ignore_index=True)
+                logger.info(f"Successfully combined chunks. Total rows: {len(df_mariadb)}")
+            except MemoryError:
+                logger.warning("Memory error during concat, using iterative processing")
+                # Альтернативный подход для больших датасетов
+                df_mariadb = process_chunks_iteratively(all_chunks, export_path)
+                all_chunks.clear()  # Освобождаем память
+            
+            logger.info(f"Extracted {len(df_mariadb)} rows from MariaDB in {chunk_number} chunks")
+            
+            # Сохраняем в файл с обработкой ошибок
+            try:
+                df_mariadb.to_parquet(export_path, index=False, compression='snappy')
+                logger.info(f"Data saved to {export_path}")
+            except Exception as e:
+                logger.error(f"Error saving to parquet: {str(e)}")
+                # Пробуем альтернативный формат
+                csv_path = export_path.replace('.parquet', '.csv')
+                df_mariadb.to_csv(csv_path, index=False)
+                export_path = csv_path 
+                logger.info(f"Data saved to CSV instead: {export_path}")
             
             # Формируем DataFrame с одним столбцом 'key'
             df_keys = pd.DataFrame({'key': all_keys})
@@ -519,20 +513,20 @@ def extract_from_mariadb(**kwargs):
             ti.xcom_push(key='mariadb_data', value=export_path)
             ti.xcom_push(key='mariadb_keys_path', value=keys_path_to_use)
             ti.xcom_push(key='has_new_data', value=True)
-            ti.xcom_push(key='total_rows_extracted', value=total_rows)
-            ti.xcom_push(key='chunks_processed', value=chunk_number)
+            ti.xcom_push(key='total_rows_extracted', value=len(df_mariadb))
             
             logger.info(f"MariaDB data prepared successfully. Total keys: {len(all_keys)}")
             
             # Освобождаем память
-            del df_keys
+            del df_mariadb
+            del all_chunks
             del all_keys
             gc.collect()
             
     except Exception as e:
         logger.error(f"Error in extract_from_mariadb: {str(e)}", exc_info=True)
         raise AirflowException(f"Extraction from MariaDB failed: {str(e)}")
-
+    
 # Находим записи, у которых изменилась сумма nomenclature_cost_price и nomenclature_cost_price_total
 @retry_with_backoff()
 def find_changed_cost_records(**kwargs):
@@ -695,93 +689,103 @@ def find_changed_cost_records(**kwargs):
 # Функция для очистки логов и временных файлов ClickHouse
 def cleanup_clickhouse_temp_files(**kwargs):
     try:
-        logger.info("Starting ClickHouse temporary files cleanup")
+        logger.info("Starting ClickHouse temporary files cleanup via remote SQL")
         
-        # Пути к временным файлам ClickHouse (могут отличаться в зависимости от установки)
-        clickhouse_temp_paths = [
-            '/var/lib/clickhouse/tmp/',
-            '/var/lib/clickhouse/store/*/tmp_*',
-            '/var/lib/clickhouse/data/*/tmp_*',
-        ]
-        
-        # Пути к логам ClickHouse (можно очистить старые логи)
-        clickhouse_log_paths = [
-            '/var/log/clickhouse/clickhouse-server.log.*',
-            '/var/log/clickhouse/clickhouse-server.err.log.*',
-        ]
-        
-        cleaned_size = 0
-        cleaned_files = 0
-        
-        # Очищаем временные файлы
-        for temp_path in clickhouse_temp_paths:
-            try:
-                # Используем glob для поиска файлов по шаблону
-                import glob
-                for file_path in glob.glob(temp_path):
-                    try:
-                        if os.path.isfile(file_path):
-                            file_size = os.path.getsize(file_path)
-                            os.remove(file_path)
-                            cleaned_size += file_size
-                            cleaned_files += 1
-                            logger.info(f"Removed temporary file: {file_path} ({file_size} bytes)")
-                        elif os.path.isdir(file_path):
-                            # Для директорий используем shutil
-                            dir_size = sum(f.stat().st_size for f in os.scandir(file_path) if f.is_file())
-                            shutil.rmtree(file_path)
-                            cleaned_size += dir_size
-                            cleaned_files += 1
-                            logger.info(f"Removed temporary directory: {file_path} ({dir_size} bytes)")
-                    except Exception as e:
-                        logger.warning(f"Could not remove {file_path}: {str(e)}")
-            except Exception as e:
-                logger.warning(f"Error processing path {temp_path}: {str(e)}")
-        
-        # Очищаем старые логи (оставляем только текущие)
-        for log_path in clickhouse_log_paths:
-            try:
-                import glob
-                for file_path in glob.glob(log_path):
-                    try:
-                        if os.path.isfile(file_path):
-                            file_size = os.path.getsize(file_path)
-                            os.remove(file_path)
-                            cleaned_size += file_size
-                            cleaned_files += 1
-                            logger.info(f"Removed log file: {file_path} ({file_size} bytes)")
-                    except Exception as e:
-                        logger.warning(f"Could not remove log file {file_path}: {str(e)}")
-            except Exception as e:
-                logger.warning(f"Error processing log path {log_path}: {str(e)}")
-        
-        # Проверяем свободное место после очистки
-        try:
-            statvfs = os.statvfs('/var/lib/clickhouse')
-            free_space_gb = (statvfs.f_frsize * statvfs.f_bavail) / (1024 ** 3)
-            total_space_gb = (statvfs.f_frsize * statvfs.f_blocks) / (1024 ** 3)
-            logger.info(f"Disk space after cleanup: {free_space_gb:.2f} GB free of {total_space_gb:.2f} GB total")
+        with DatabaseConnectionContext() as db:
+            ch_hook = db.get_clickhouse_hook()
+            client = ch_hook.get_conn()
             
-            if free_space_gb < 1.0:  # Меньше 1 GB свободного места
-                logger.error(f"CRITICAL: Very low disk space after cleanup: {free_space_gb:.2f} GB")
-                raise AirflowException(f"Insufficient disk space after cleanup: {free_space_gb:.2f} GB")
+            # 1. Останавливаем текущие мутации (если есть проблемы с местом)
+            try:
+                stop_mutations_sql = """
+                KILL MUTATION 
+                WHERE database = currentDatabase() 
+                AND table = '{0}'
+                AND command LIKE '%DELETE%'
+                """.format(TABLE_NAME)
+                result = client.execute(stop_mutations_sql)
+                if result:
+                    logger.info(f"Stopped {len(result)} running DELETE mutations")
+                else:
+                    logger.info("No running DELETE mutations found")
+            except Exception as e:
+                logger.warning(f"Could not stop mutations: {str(e)}")
+            
+            # 2. Очищаем системные кеши для освобождения памяти
+            try:
+                cleanup_system_sql = """
+                SYSTEM DROP MARK CACHE;
+                SYSTEM DROP UNCOMPRESSED CACHE;
+                SYSTEM DROP COMPILED EXPRESSION CACHE;
+                """
+                client.execute(cleanup_system_sql)
+                logger.info("Cleaned system caches")
+            except Exception as e:
+                logger.warning(f"Could not clean system caches: {str(e)}")
+            
+            # 3. Проверяем свободное место на удаленном сервере
+            try:
+                disk_space_sql = """
+                SELECT 
+                    name,
+                    free_space as free_bytes,
+                    free_space / 1024 / 1024 / 1024 as free_gb,
+                    total_space / 1024 / 1024 / 1024 as total_gb
+                FROM system.disks
+                """
+                disk_info = client.execute(disk_space_sql)
                 
-        except Exception as e:
-            logger.warning(f"Could not check disk space: {str(e)}")
+                for disk in disk_info:
+                    disk_name, free_bytes, free_gb, total_gb = disk
+                    logger.info(f"Disk {disk_name}: {free_gb:.2f} GB free of {total_gb:.2f} GB total")
+                    
+                    if free_gb < 1.0:  # Меньше 1 GB свободного места
+                        logger.error(f"CRITICAL: Low disk space on {disk_name}: {free_gb:.2f} GB")
+                        
+            except Exception as e:
+                logger.warning(f"Could not check disk space: {str(e)}")
+            
+            # 4. Проверяем и отменяем зависшие мутации
+            try:
+                check_mutations_sql = f"""
+                SELECT 
+                    mutation_id,
+                    command,
+                    create_time,
+                    now() - create_time as running_time
+                FROM system.mutations 
+                WHERE database = currentDatabase() 
+                AND table = '{TABLE_NAME}'
+                AND is_done = 0
+                AND (now() - create_time) > 3600
+                """
+                stuck_mutations = client.execute(check_mutations_sql)
+                
+                if stuck_mutations:
+                    logger.warning(f"Found {len(stuck_mutations)} stuck mutations")
+                    for mutation in stuck_mutations:
+                        mutation_id, command, create_time, running_time = mutation
+                        logger.warning(f"Stuck mutation: {mutation_id}, running for {running_time} seconds")
+                        
+                        # Пытаемся отменить зависшую мутацию
+                        try:
+                            kill_mutation_sql = f"KILL MUTATION WHERE mutation_id = '{mutation_id}'"
+                            client.execute(kill_mutation_sql)
+                            logger.info(f"Killed stuck mutation: {mutation_id}")
+                        except Exception as kill_error:
+                            logger.warning(f"Could not kill mutation {mutation_id}: {str(kill_error)}")
+                else:
+                    logger.info("No stuck mutations found")
+                
+            except Exception as e:
+                logger.warning(f"Could not check mutations: {str(e)}")
         
-        logger.info(f"ClickHouse cleanup completed: {cleaned_files} files removed, {cleaned_size} bytes freed")
-        
-        # Сохраняем информацию об очистке в XCom
-        ti = kwargs['ti']
-        ti.xcom_push(key='clickhouse_cleanup_info', value={
-            'cleaned_files': cleaned_files,
-            'cleaned_bytes': cleaned_size,
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        })
+        logger.info("Remote ClickHouse cleanup completed successfully")
         
     except Exception as e:
         logger.error(f"Error in cleanup_clickhouse_temp_files: {str(e)}")
-        raise AirflowException(f"ClickHouse temporary files cleanup failed: {str(e)}")
+        # Все равно очищаем локальные файлы
+        cleanup_file()
     
 # Удаляем из ClickHouse записи, у которых изменились цены себестоимости
 @retry_with_backoff()
@@ -1112,9 +1116,6 @@ def cleanup_file(**kwargs):
 
 # Добавим новую функцию для обработки ошибки нехватки места
 def handle_disk_space_error(**kwargs):
-    """
-    Обработчик ошибки нехватки места на диске
-    """
     try:
         ti = kwargs['ti']
         
@@ -1129,13 +1130,13 @@ def handle_disk_space_error(**kwargs):
             cleanup_clickhouse_temp_files(**kwargs)
             
             # Выполняем очистку временных файлов DAG
-            cleanup_file(**kwargs)
+            cleanup_file(ti=ti)
             
             # Логируем критическую ошибку
             logger.critical("CRITICAL: Insufficient disk space. DAG failed after emergency cleanup.")
             
         else:
-            logger.info("No disk space error detected in exception")
+            logger.info(f"DAG failed with different error: {str(exception)}")
             
     except Exception as e:
         logger.error(f"Error in handle_disk_space_error: {str(e)}")
@@ -1160,13 +1161,13 @@ with DAG(
     max_active_runs=1,
     concurrency=1,
     default_args=default_args,
-    on_failure_callback=handle_disk_space_error,
+    on_failure_callback=handle_disk_space_error  # Глобальный обработчик ошибок
 ) as dag:
     
     check_volume = PythonOperator(
-    task_id='check_data_volume',
-    python_callable=check_data_volume,
-    provide_context=True
+        task_id='check_data_volume',
+        python_callable=check_data_volume,
+        provide_context=True
     )
 
     extract = PythonOperator(
@@ -1175,10 +1176,11 @@ with DAG(
     )
 
     find_changed_cost_records_task = PythonOperator(
-    task_id='find_changed_cost_records',
-    python_callable=find_changed_cost_records
+        task_id='find_changed_cost_records',
+        python_callable=find_changed_cost_records
     )
 
+    # Очистка ClickHouse перед удалением данных
     cleanup_before_deletion = PythonOperator(
         task_id='cleanup_before_deletion',
         python_callable=cleanup_clickhouse_temp_files,
@@ -1200,6 +1202,7 @@ with DAG(
         python_callable=load_incremental_to_clickhouse
     )
     
+    # Существующая функция очистки файлов
     cleanup = PythonOperator(
         task_id='cleanup_file',
         python_callable=cleanup_file,
